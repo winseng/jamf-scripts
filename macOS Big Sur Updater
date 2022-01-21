@@ -1,0 +1,499 @@
+## Date: Feb 2021
+##
+## macOS Big Sur Update Script
+## Jiten Bhojwani
+
+
+## This script evolved out of the macOS Catalina Prompt Window script I used for
+## the Catalina roll out. I found that the script I wrote didn't really account
+## for certain situations, like when someone is presenting, when someone does not
+## have their charger plugged in, and so on. I also wanted to give end users more
+## flexibility to update when they want but still retain control of how many times
+## someone could defer. While Jamf Pro has a deferral system built in, I found it kind
+## of lacking in presence, customizability, and flexibility. So I went with the scripted
+## option instead.
+##
+## Luckily, the Mac admin community is brimming with scripts. A few written by
+## Balmes Pavlov have provided helpful functions to complete those checks. His workflows
+## surrounding macOS update scenarios also heavily influenced how I wrote this script as well.
+## You can find his GitHub page here:
+##
+## https://github.com/bp88/
+##
+## This script is also meant to be used with Jamf pro. It relies on jamfHelper, Jamf's
+## built-in message/helper tool. It also is meant to be used in policy #2 as part of a 2
+## policy workflow to accomplish a macOS Major version upgrade.
+## 
+## Policy 1 will cache the macOS installer onto the machine and then force an inventory
+## update. The machine then gets put into a smart group which can then be scoped to the
+## second policy.
+##
+## Policy 2 will include this script. In Jamf Pro the policy will run on a daily check-in
+## basis since the script .
+##
+## CHANGELOG
+##
+## v0.2, 2021-03-02:
+##		- Commented out portions to launch the update, so it is easy to test the script without a payload
+##		- Moved all in-day deferral logic into the reminder window since the reminder window will only appear
+##		  after a deferral has been selected.
+##		- Made some updates to the messaging prompts
+##		- Started importing functions from old scripts to implement postponements
+##		- Commented out Timer statements since it seems like Timer is being unused
+##
+## v0.3, 2021-03-09:
+##		- Launch update function has been un-commented and is now live. This version is the one distributed to our test group
+##		- The install icons don't seem to be working, I've used the actual paths instead of the icon variables.
+##
+## v0.4, 2021-03-19:
+##		- Changed the wording of the prompts to be more clear
+##		- In response to some issues with the update launching, I am redirecting the stdout and stderr of Launch_Update to /var/log/startosinstall.log
+##		- Integrated Filevault check to run right after display sleep assertions check
+##		- Integrated power check before an update is launched
+##		- Re-implemented the install icon variables for testing
+##		- Added in OS Check before any actions are done in Main
+##
+## v0.5, 2021-03-22
+##		- Added in free space check
+##
+## v0.6, 2021-04-01
+##		- Added in set -m to split child processes into their own threads, which might resolve the issues with the update actually executing
+##
+## v0.7, 2021-04-06
+##		- Added in a freespace check under the main prompt window as I did not remember to put that in before
+##
+
+
+## JAMF Pro Script Parameters:
+## Parameter 4: Optional. Number of postponements allowed. Default: 3
+## Parameter 5: Optional. Number of seconds the daily prompt and reminder prompt should remain up. Default: 7200 seconds
+## Parameter 6: Optional. Contact email, number, or department name used in messaging.
+##              Default: our Helpdesk by opening a ticket in our ticketing system.
+## Parameter 7: Optional. First in-day deferral in seconds. Default: 3600 seconds
+## Parameter 8: Optional. Second in-day deferral in seconds. Default: 7200 seconds
+## Parameter 9: Optional. Third in-day deferral in seconds. Default: 14400 seconds
+##
+## Here is the expected workflow with this script:
+##
+## If no user is logged in and the charger is plugged in, the script will install updates through the command line and
+##    shutdown/restart as required.
+## If a user is logged in, the user will get prompted
+##		to Install (now, 1 hours, 2  hours, or 4 hours) or postpone until tomorrow.
+##
+##
+##
+## There are a few exit codes in this script that may indicate points of failure:
+## 10: Unknown error
+## 11: No power source detected while doing CLI update.
+## 12: Big Sur Installer does not exist on the machine.
+## 13: FV encryption is still in progress.
+## 14: macOS is already up to date
+## 15: Insufficient space to perform update.
+##
+
+## Feature Improvements to be made:
+##
+## - Add try to run install when no user logged in
+## - Make postponements independent from jamf by integrating a date check
+##
+
+
+####################################################################################################################
+
+set -x
+
+## Parameters from Jamf Pro
+
+MaxPostponeAttempts=$4
+TimerSeconds=$5
+ITContact=$6
+FirstDeferralValue=$7
+SecondDeferralValue=$8
+ThirdDeferralValue=$9
+
+
+CurrPostponeAttempts=0
+IntitialPostponeAttempts=0
+
+## Set Defaults for parameters if empty
+
+[ -z "$MaxPostponeAttempts" ] && MaxPostponeAttempts="3"
+[ -z "$TimerSeconds" ] && TimerSeconds="7200" # 2 hours
+[ -z "$ITContact" ] && ITContact="our Helpdesk by opening a ticket in our ticketing system."
+[ -z "$FirstDeferralValue" ] && FirstDeferralValue="3600" # 1 hour
+[ -z "$SecondDeferralValue" ] && SecondDeferralValue="7200" # 2 hours
+[ -z "$ThirdDeferralValue" ] && ThirdDeferralValue="14400" # 4 hours
+
+## Insert code to set CurrPostponeAttempts
+
+# Message to tell user to contact IT
+ErrorMsg="There seems to have been an error installing the updates. Please contact $ITContact."
+# Message to display when computer is running off battery
+NoACPower="The computer is currently running off battery and is not plugged into a power source."
+# Out of Space Message
+NoSpacePrompt="You do not have enough free space to perform the update. Please clean up some files, the update will check in again tomorrow."
+
+## Paths to icons used with jamfHelper prompts
+
+# Path to the alert caution icon
+AlertIcon="/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/AlertStopIcon.icns"
+# Path to the alert caution icon
+InstallIcon="/Applications/Install macOS Big Sur.app/Contents/Resources/InstallAssistant.icns"
+# Path to the battery icon
+BatteryIcon="/System/Library/CoreServices/PowerChime.app/Contents/Resources/battery_icon.png"
+# Path to the FileVault icon
+FilevaultIcon="/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/FileVaultIcon.icns"
+
+## Functions
+
+## Used to wait until the end user plugs in the power. If power is not supplied within 5 minutes. The script will exit.
+powerCheck (){
+
+    # This is meant to be used when doing CLI update installs.
+    # Updates through the GUI can already determine its own requirements to proceed with
+    # the update process.
+    # Let's wait 5 minutes to see if computer gets plugged into power.
+	if [[ "$(/usr/bin/pmset -g ps | /usr/bin/grep "Battery Power")" = "Now drawing from 'Battery Power'" ]]; then
+
+		/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType utility -icon "$BatteryIcon" -title "IT" -heading "macOS Big Sur Update" -description "It looks like your charger is not plugged in. The installer will wait for you to plug in a charger.
+
+		If no charger is plugged in within 5 minutes, this update will exit." -timeout 300 -countdown &
+
+		power_messagePID=$!
+
+   		for (( i = 1; i <= 20; ++i )); do
+        	if [[ "$(/usr/bin/pmset -g ps | /usr/bin/grep "Battery Power")" = "Now drawing from 'Battery Power'" ]] && [[ $i = 20 ]]; then
+            	echo "$NoACPower"
+            	/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType utility -icon "$BatteryIcon" -title "IT" -heading "macOS Big Sur Update" -description "A charger was not plugged in on time and the update was cancelled. We will try updating again tomorrow." &
+       		elif [[ "$(/usr/bin/pmset -g ps | /usr/bin/grep "Battery Power")" = "Now drawing from 'Battery Power'" ]]; then
+            	/bin/sleep 15
+        	else
+        		kill $power_messagePID
+            	return 0
+       	 	fi
+    	done
+    exit 11
+	fi
+}
+
+## Used to check if the OS is already up to date
+OS_Check(){
+
+	OS_MajorVersion="$(/usr/bin/sw_vers -productVersion | /usr/bin/cut -d '.' -f 1)"
+
+	if [[ OS_MajorVersion -ge 11 ]]; then
+		echo "OS is already on version 11, exiting..."
+		exit 14
+	fi
+}
+
+## Used to check if FileVault is currently encrypting
+fvStatusCheck (){
+
+    # Check to see if the encryption process is complete
+    FVStatus="$(/usr/bin/fdesetup status)"
+    if [[ $(/usr/bin/grep -q "Encryption in progress" <<< "$FVStatus") ]]; then
+        echo "The encryption process is still in progress."
+        echo "$FVStatus"
+        exit 13
+    fi
+}
+
+## 
+freespaceCheck(){
+
+	# Find free space and exit script if less than 40 GB avail
+	Freespace="$(df -H / | awk '//{ print $4}' | sed -n 2p | tr -d G)"
+	if [[ "$Freespace" -lt "40" ]]; then
+		echo "There is less than 40G of space left. Space Left: $Freespace. Notifying user and exiting script..."
+		/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType utility -icon "$AlertIcon" -title "IT" -heading "macOS Big Sur Update" -description "You have less than 40 GB of space left on you drive. The current available storage is $Freespace GB. Please clean up some files first so the update can run." &
+		exit 15
+	fi
+}
+
+## Function to do best effort check if using presentation or web conferencing is active
+checkForDisplaySleepAssertions() {
+    Assertions="$(/usr/bin/pmset -g assertions | /usr/bin/awk '/NoDisplaySleepAssertion | PreventUserIdleDisplaySleep/ && match($0,/\(.+\)/) && ! /coreaudiod/ {gsub(/^\ +/,"",$0); print};')"
+    
+    # There are multiple types of power assertions an app can assert.
+    # These specifically tend to be used when an app wants to try and prevent the OS from going to display sleep.
+    # Scenarios where an app may not want to have the display going to sleep include, but are not limited to:
+    #   Presentation (KeyNote, PowerPoint)
+    #   Web conference software (Zoom, Webex)
+    #   Screen sharing session
+    # Apps have to make the assertion and therefore it's possible some apps may not get captured.
+    # Some assertions can be found here: https://developer.apple.com/documentation/iokit/iopmlib_h/iopmassertiontypes
+    if [[ "$Assertions" ]]; then
+        echo "The following display-related power assertions have been detected:"
+        echo "$Assertions"
+        echo "Exiting script to avoid disrupting user while these power assertions are active."
+        
+        # Track the number of display sleep assertions encountered
+        #DisplaySleepAssertionsEncountered="$(readPlistValue "$BundleID" "DisplaySleepAssertionsEncountered" "$DeprecationPlist")"
+        #[[ -z "$DisplaySleepAssertionsEncountered" ]] && DisplaySleepAssertionsEncountered="0"
+        
+        #setPlistValue "$BundleID" "DisplaySleepAssertionsEncountered" "integer" "$DisplaySleepAssertionsEncountered" "$DeprecationPlist"
+        
+        exit 0
+    fi
+}
+
+##	Checks existence of /Users/Shared/macOSBigSur-Update
+##	if directory does not exist, create directory
+PostponementsPath(){
+
+	if [[ ! -d /Users/Shared/macOSBigSur-Update ]]
+	then
+		echo "macOSBigSur-Update folder does not exist!"
+		echo "Creating folder..."
+		cd /Users/Shared/
+		mkdir macOSBigSur-Update
+		##cd macOSBigSur-Update
+	else
+		echo "macOSBigSur-Update folder exists!"
+	fi
+}
+
+##	Check existence of PostponementsLeft.txt
+##	if file does not exist, create file and write 0
+PostponementsFile(){
+
+	if [[ ! -e /Users/Shared/macOSBigSur-Update/Postponements.txt ]]
+	then
+		echo "Postponements text file does not exist!"
+		touch /Users/Shared/macOSBigSur-Update/Postponements.txt
+		echo "$IntitialPostponeAttempts" > /Users/Shared/macOSBigSur-Update/Postponements.txt
+	else
+		echo "Postponements text file exists!"
+	fi
+}
+
+## 	Reads number of postponements from Postponements.txt
+##	and stores it into  variable CurrPostponeAttempts
+read_Postponements(){
+
+	cd /Users/Shared/macOSBigSur-Update/
+	CurrPostponeAttempts=$(<Postponements.txt)
+	echo "Postponements from txt: " $CurrPostponeAttempts
+}
+
+##	Increment number of Postponements left and write to file
+write_Postponements(){
+
+	echo "Updating number of postponements"
+	CurrPostponeAttempts=$(expr $CurrPostponeAttempts + 1)
+	cd /Users/Shared/macOSBigSur-Update/
+	echo $CurrPostponeAttempts > Postponements.txt
+	#
+	#	Test write success/fail
+	if [ $? == 0 ]
+	then
+		echo "Write success!"
+	else
+		echo "Write fail!"
+	fi
+}
+
+## Prompt when the update is executing (point of no return)
+Wait_Prompt(){
+
+	/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType fs -icon "$InstallIcon" -title "IT" -heading "macOS Big Sur Update" -description "Please wait while the update is being prepared. This may take some time and quitting this window will not stop the process, please do not turn off or restart your computer. Your computer will automatically restart when the update has finished preparing.
+
+	If you feel too much time has passed, please contact $ITContact.
+
+	START TIME: $(/bin/date +"%b %d %Y %T")"
+
+}
+
+Reminder_Prompt(){
+
+	Prompt2=`/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType utility -icon "$InstallIcon" -title "IT" -heading "macOS Big Sur Update" -description "Your computer is now ready to install macOS Big Sur. Please first connect your charger and close anything you are working on. Then click \"Ok\" to install the update.
+
+		If you are unable to do this update today, click \"Postpone\" so the update will prompt you tomorrow. The number of postponements you have left is: $PostponementsLeft.
+
+		If no selection is made before the timer runs out or if this window is quit, the update will automatically install!
+
+		If you have any questions, please contact $ITContact.
+
+		Thank you,
+		The Corporate Technology Team" -button1 "Ok" -button2 "Postpone" -defaultbutton "1" -cancelbutton "2" -timeout "$TimerSeconds" -countdown`
+
+	if [[ "$Prompt2" -eq "0" ]]; then
+		echo "User has chosen to Install Now or the window timed out"
+		echo "Running power check..."
+		powerCheck
+		echo "Running Freespace Check..."
+		freespaceCheck
+		echo "Sending a Wait Prompt..."
+		Wait_Prompt &
+		Wait_PromptPID=$!
+		Launch_Update $Wait_PromptPID
+		exit 0
+	elif [[ "$Prompt2" -eq "2" ]]; then
+		echo "User has chosen to postpone"
+		write_Postponements
+		echo "Sending user a Postponement confirmation"
+		PostponeConfirmation_Prompt
+		exit 0
+	elif [[ "$Prompt2" -eq "239" ]]; then
+		echo "User has quit the window"
+		echo "Postpone until tomorrow"
+		write_Postponements
+		echo "Sending user a postponement confirmation"
+		PostponeConfirmation_Prompt
+		exit 0
+	fi
+
+}
+
+ForceUpdate_Prompt(){
+
+
+	Prompt3=`/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType utility -icon "$InstallIcon" -title "IT" -heading "macOS Big Sur Update" -description "Your computer is now ready to install macOS Big Sur and you do not have any postponements left. Please first connect your charger and close anything you are working on. Then click \"Ok\" to install the update.
+
+		If no selection is made before the timer runs out or if this window is quit, the update will automatically install!
+
+		If you have any questions, please contact $ITContact.
+
+		Thank you,
+		The Corporate Technology Team" -button1 "Ok" -defaultbutton "1" -timeout "$TimerSeconds" -countdown`
+
+}
+
+PostponeConfirmation_Prompt(){
+
+	/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType utility -icon "$InstallIcon" -title "IT" -heading "macOS Big Sur Update" -description "Ok, we'll try updating again tomorrow." -button1 "Close" -defaultbutton "1"
+
+}
+
+DeferralConfirmation_Prompt(){
+
+	/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType utility -icon "$InstallIcon" -title "IT" -heading "macOS Big Sur Update" -description "Ok, we'll try updating again later." -button1 "Close" -defaultbutton "1"
+
+}
+
+Error_Prompt(){
+
+	/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType utility -icon "$AlertIcon" -title "IT" -heading "macOS Big Sur Update" -description "$ErrorMsg" -button1 "Close" -defaultbutton "1"
+
+}
+
+Launch_Update(){
+
+	echo "Launching update..."
+
+	/Applications/Install\ macOS\ Big\ Sur.app/Contents/Resources/startosinstall --nointeraction --forcequitapps --agreetolicense --pidtosignal $1 >> /var/log/startosinstall.log 2>&1 &
+}
+
+
+
+###############################
+##			MAIN 			 ##
+###############################
+
+set -m
+
+OS_Check
+
+##	Set up Postponements first
+PostponementsPath
+PostponementsFile
+read_Postponements
+PostponementsLeft="$(($MaxPostponeAttempts - $CurrPostponeAttempts))"
+
+
+##	If the Big Sur installer exists
+##
+if [[ -e /Applications/Install\ macOS\ Big\ Sur.app ]]; then
+
+	checkForDisplaySleepAssertions
+	fvStatusCheck
+
+	if [[ "$PostponementsLeft" -le 0 ]]; then
+		ForceUpdate_Prompt
+		echo "Running power check..."
+		powerCheck
+		echo "Running Freespace Check..."
+		freespaceCheck
+		echo "Sending a Wait Prompt..."
+		Wait_Prompt &
+		Wait_PromptPID=$!
+		Launch_Update $Wait_PromptPID
+		exit 0
+	else
+		Prompt=`/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType utility -icon "$InstallIcon" -title "IT" -heading "macOS Big Sur Update" -description "Your computer is now ready to install macOS Big Sur. Please first connect your charger and close anything you are working on. Then select when you want the update to install from the dropdown menu and click \"Ok\".
+
+		If you are unable to do this update today, click \"Postpone\" so the update will prompt you tomorrow. The number of postponements you have left is: $PostponementsLeft.
+
+		If no selection is made before the timer runs out or if this window is quit, the update will automatically install!
+
+		If you have any questions, please contact $ITContact.
+
+		Thank you,
+		The Corporate Technology Team" -button1 "Ok" -button2 "Postpone" -defaultbutton "1" -cancelbutton "2" -timeout "$TimerSeconds" -countdown -showDelayOptions "0, $FirstDeferralValue, $SecondDeferralValue, $ThirdDeferralValue"`
+
+		buttonClicked="${Prompt:$i-1}"
+		timeChosen="${Prompt%?}"
+
+		echo "Button Clicked was button $buttonClicked"
+		echo "Time Chosen was $timeChosen"
+
+		##	Process the result of the jamfHelper
+		if [[ "$buttonClicked" -eq "1" ]]; then
+			echo "User clicked button 1 to install or the window has timed out"
+			if [[ -z "$timeChosen" ]]; then
+				echo "User has chosen to start now"
+				echo "Running power check..."
+				powerCheck
+				echo "Running Freespace Check..."
+				freespaceCheck
+				echo "Sending a Wait Prompt..."
+				Wait_Prompt &
+				Wait_PromptPID=$!
+				Launch_Update $Wait_PromptPID
+				exit 0
+			elif [[ "$timeChosen" -eq "$FirstDeferralValue" ]]; then
+				DeferralConfirmation_Prompt &
+				echo "User has chosen to defer by $FirstDeferralValue seconds"
+				echo "Sleeping before prompting user again"
+				sleep $FirstDeferralValue
+				Reminder_Prompt
+			elif [[ "$timeChosen" -eq "$SecondDeferralValue" ]]; then
+				DeferralConfirmation_Prompt &
+				echo "User has chosen to defer by $SecondDeferralValue seconds"
+				echo "Sleeping before prompting user again"
+				sleep $SecondDeferralValue
+				Reminder_Prompt
+			elif [[ "$timeChosen" -eq "$ThirdDeferralValue" ]]; then
+				DeferralConfirmation_Prompt &
+				echo "User has chosen to defer by $ThirdDeferralValue seconds"
+				echo "Sleeping before prompting user again"
+				sleep $ThirdDeferralValue
+				Reminder_Prompt
+			else
+				echo "An unknown error has occurred"
+				echo "Sending user error message"
+				Error_Prompt
+				exit 10
+			fi
+		elif [[ "$buttonClicked" -eq "2" ]]; then
+			echo "User has chosen to postpone"
+			write_Postponements
+			echo "Sending user a Postponement confirmation"
+			PostponeConfirmation_Prompt
+			exit 0
+		elif [[ "$Prompt" -eq "239" ]]; then
+			echo "User has quit the window"
+			echo "Postpone until tomorrow"
+			write_Postponements
+			echo "Sending user a postponement confirmation"
+			PostponeConfirmation_Prompt
+			exit 0
+		fi
+	fi
+## Used to catch the case where the installer has completed but the policy starts over
+## or the policy is mistankely applied to those who do not have the installer app
+else
+	echo "Big Sur installer does not exist on this machine"
+	exit 12
+fi
