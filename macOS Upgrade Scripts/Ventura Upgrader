@@ -310,7 +310,7 @@ write_Postponements(){
 ## Prompt when the update is executing (point of no return)
 Wait_Prompt(){
 
-	/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType fs -icon "$InstallIcon" -title "Forbes IT" -heading "macOS Ventura Update" -description "Please wait while the update is being prepared. This may take some time and quitting this window will not stop the process, please do not turn off or restart your computer. Your computer will automatically restart when the update has finished preparing.
+	/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType utility -icon "$InstallIcon" -title "Forbes IT" -heading "macOS Ventura Update" -description "Please wait while the update is being prepared. This may take some time and quitting this window will not stop the process, please do not turn off or restart your computer. Your computer will automatically restart when the update has finished preparing.
 
 	If you feel too much time has passed, please contact $ITContact.
 
